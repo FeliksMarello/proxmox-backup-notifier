@@ -106,7 +106,7 @@ mkdir -p /opt/proxmox-notifier
 
 # Размещение скрипта
 nano /opt/proxmox-notifier/proxmox-telegram-notifier.sh
-# Вставьте содержимое скрипта v3.9
+# Вставьте содержимое скрипта
 
 # Права доступа
 chmod +x /opt/proxmox-notifier/proxmox-telegram-notifier.sh
