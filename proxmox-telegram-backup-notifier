@@ -1,0 +1,1900 @@
+#!/bin/bash
+# Proxmox Backup Telegram Notifier
+# ========================
+# КОНФИГУРАЦИЯ  
+# ========================
+PROXMOX_API_URL="https://your-proxmox-server:8006/api2/json"        # API Proxmox
+PROXMOX_API_TOKEN="PVEAPIToken=user@pam!tokenid=your-secret"        # API Taken Proxmox
+PROXMOX_NODE=""                                                     # Режим работы (если пусто, то по умолчанию - claster)
+TELEGRAM_BOT_TOKEN="your-bot-token"                                 # Telegram Bot Token
+TELEGRAM_CHAT_ID="your-chat-id"                                     # Telegram Chat ID
+TELEGRAM_THREAD_ID=""                                               # Telegram THREAD (если пусто, по умолчанию - главная тема)
+CHECK_INTERVAL=15                                                   # Проверка каждые 15 секунд
+MAX_TASK_AGE=7200                                                   # Макс. возраст running задач (2 часа)
+SENT_TASKS_FILE="/tmp/proxmox_backup_sent_tasks.txt"
+SENT_ERRORS_FILE="/tmp/proxmox_backup_sent_errors.txt"
+TRACKING_TASKS_FILE="/tmp/proxmox_backup_tracking_tasks.txt"
+LOG_FILE="/var/log/proxmox-telegram-notifier.log"
+RECENT_TASK_THRESHOLD=3600                                          # Обрабатывать задачи не старше 1 часа
+
+# НАСТРОЙКИ DEBUG И ОЧИСТКИ
+DEBUG_ENABLED=false         # true/false для включения/отключения DEBUG сообщений
+CLEANUP_ENABLED=true        # Включить автоочистку старых записей
+CLEANUP_DAYS=7             # Удалять записи старше N дней
+CLEANUP_INTERVAL_HOURS=24  # Запускать очистку каждые N часов
+
+# НАСТРОЙКИ ПРЕДУПРЕЖДЕНИЙ О ХРАНИЛИЩЕ (ИНТЕГРИРОВАННЫЕ В ОТЧЕТЫ)
+STORAGE_WARNING_ENABLED=true    # Включить предупреждения о заполненности хранилища в отчетах
+STORAGE_WARNING_THRESHOLD=90    # Порог предупреждения в процентах (по умолчанию 90%)
+STORAGE_CRITICAL_THRESHOLD=95   # Критический порог в процентах
+
+# ========================
+# БАЗОВЫЕ ФУНКЦИИ
+# ========================
+log_message() {
+    local message="$1"
+    local is_debug="${2:-false}"
+    local timestamp=$(date '+%d.%m.%Y %H:%M:%S')
+
+    # Если это DEBUG сообщение, проверяем включен ли DEBUG
+    if [ "$is_debug" = "true" ] && [ "$DEBUG_ENABLED" != "true" ]; then
+        return
+    fi
+
+    echo "[$timestamp] $message" >> "$LOG_FILE"
+}
+
+# Функция для DEBUG сообщений
+log_debug() {
+    local message="$1"
+    log_message "DEBUG: $message" "true"
+}
+
+format_time() {
+    local timestamp="$1"
+    if [ -n "$timestamp" ] && [ "$timestamp" != "Unknown" ] && [ "$timestamp" != "Running" ]; then
+        date -d "$timestamp" '+%d.%m.%Y %H:%M:%S' 2>/dev/null || echo "$timestamp"
+    else
+        echo "$timestamp"
+    fi
+}
+
+# ========================
+# ФУНКЦИИ ОЧИСТКИ
+# ========================
+cleanup_old_entries() {
+    local file_path="$1"
+    local days="$2"
+
+    if [ ! -f "$file_path" ]; then
+        return
+    fi
+
+    # Создаем временный файл
+    local temp_file=$(mktemp)
+    local cutoff_date=$(date -d "-${days} days" '+%s')
+
+    # Читаем файл и оставляем только недавние записи
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            # Извлекаем timestamp из UPID (если возможно)
+            local task_timestamp=$(echo "$line" | grep -oP 'UPID:[^:]*:[^:]*:\K[^:]*' | head -1)
+            if [ -n "$task_timestamp" ] && [ "$task_timestamp" -gt "$cutoff_date" ]; then
+                echo "$line" >> "$temp_file"
+            elif [ -z "$task_timestamp" ]; then
+                # Если не можем извлечь timestamp, оставляем запись
+                echo "$line" >> "$temp_file"
+            fi
+        fi
+    done < "$file_path"
+
+    # Заменяем оригинальный файл
+    mv "$temp_file" "$file_path"
+    log_message "Очищен файл $file_path: удалены записи старше $days дней"
+}
+
+rotate_log_file() {
+    local max_size_mb="$1"
+
+    if [ ! -f "$LOG_FILE" ]; then
+        return
+    fi
+
+    # Проверяем размер файла в МБ
+    local file_size=$(du -m "$LOG_FILE" | cut -f1)
+
+    if [ "$file_size" -gt "$max_size_mb" ]; then
+        # Создаем архивную копию
+        local archive_name="${LOG_FILE}.$(date '+%Y%m%d_%H%M%S')"
+        mv "$LOG_FILE" "$archive_name"
+
+        # Сжимаем архив
+        gzip "$archive_name"
+
+        log_message "Лог-файл ротирован: создан архив ${archive_name}.gz"
+
+        # Удаляем старые архивы (старше 30 дней)
+        find "$(dirname "$LOG_FILE")" -name "$(basename "$LOG_FILE").*.gz" -mtime +30 -delete 2>/dev/null || true
+    fi
+}
+
+perform_cleanup() {
+    if [ "$CLEANUP_ENABLED" != "true" ]; then
+        return
+    fi
+
+    log_message "Запуск процедуры очистки файлов..."
+
+    # Очищаем файлы отправленных задач и ошибок
+    cleanup_old_entries "$SENT_TASKS_FILE" "$CLEANUP_DAYS"
+    cleanup_old_entries "$SENT_ERRORS_FILE" "$CLEANUP_DAYS"
+
+    # Удаляем неиспользуемый файл
+    if [ -f "$TRACKING_TASKS_FILE" ]; then
+        rm -f "$TRACKING_TASKS_FILE"
+        log_message "Удален неиспользуемый файл: $TRACKING_TASKS_FILE"
+    fi
+
+    # Ротируем лог-файл если он больше 50 МБ
+    rotate_log_file 50
+
+    # Очищаем старые временные файлы
+    find /tmp -name "tmp.*" -mtime +1 -delete 2>/dev/null || true
+
+    log_message "Процедура очистки завершена"
+}
+
+check_cleanup_needed() {
+    local cleanup_marker="/tmp/proxmox_notifier_last_cleanup"
+    local current_time=$(date +%s)
+    local cleanup_interval_seconds=$((CLEANUP_INTERVAL_HOURS * 3600))
+
+    if [ -f "$cleanup_marker" ]; then
+        local last_cleanup=$(cat "$cleanup_marker")
+        local time_since_cleanup=$((current_time - last_cleanup))
+
+        if [ "$time_since_cleanup" -gt "$cleanup_interval_seconds" ]; then
+            perform_cleanup
+            echo "$current_time" > "$cleanup_marker"
+        fi
+    else
+        # Первый запуск - создаем маркер
+        echo "$current_time" > "$cleanup_marker"
+        perform_cleanup
+    fi
+}
+
+# ========================
+# ФУНКЦИИ ПРОВЕРКИ ХРАНИЛИЩА ДЛЯ ОТЧЕТОВ
+# ========================
+get_detailed_storage_info() {
+    local storage_name="$1"
+    local node_name="$2"
+
+    local storage_response=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/storage/${storage_name}/status" 2>/dev/null)
+
+    if [ -n "$storage_response" ] && echo "$storage_response" | jq -e '.data' >/dev/null 2>&1; then
+        local total=$(echo "$storage_response" | jq -r '.data.total // 0' 2>/dev/null)
+        local used=$(echo "$storage_response" | jq -r '.data.used // 0' 2>/dev/null)
+        local avail=$(echo "$storage_response" | jq -r '.data.avail // 0' 2>/dev/null)
+
+        if [ "$total" -gt 0 ]; then
+            local used_percent=$((used * 100 / total))
+            local used_gb=$((used / 1024 / 1024 / 1024))
+            local avail_gb=$((avail / 1024 / 1024 / 1024))
+            local total_gb=$((total / 1024 / 1024 / 1024))
+
+            echo "$used_percent|$used_gb|$avail_gb|$total_gb"
+        else
+            echo "0|0|0|0"
+        fi
+    else
+        echo "0|0|0|0"
+    fi
+}
+
+check_storage_for_report() {
+    local storage_name="$1"
+    local node_name="$2"
+
+    if [ "$STORAGE_WARNING_ENABLED" != "true" ]; then
+        echo ""
+        return
+    fi
+
+    log_debug "Проверка хранилища $storage_name на узле $node_name для отчета"
+
+    local storage_info=$(get_detailed_storage_info "$storage_name" "$node_name")
+    IFS='|' read -r used_percent used_gb avail_gb total_gb <<< "$storage_info"
+
+    log_debug "Хранилище $storage_name: $used_percent% заполнено"
+
+    if [ "$used_percent" -ge "$STORAGE_WARNING_THRESHOLD" ]; then
+        # Определяем уровень предупреждения
+        local warning_level="WARNING"
+        local warning_icon="⚠️"
+        local warning_text="Рекомендуется очистка старых бэкапов"
+
+        if [ "$used_percent" -ge "$STORAGE_CRITICAL_THRESHOLD" ]; then
+            warning_level="CRITICAL"
+            warning_icon="🚨"
+            warning_text="Хранилище почти заполнено! Срочно освободите место"
+        fi
+
+        # Формируем секцию предупреждения для отчета
+        local warning_section="
+$warning_icon <b>ПРЕДУПРЕЖДЕНИЕ О ХРАНИЛИЩЕ</b>
+      • Хранилище <code>$storage_name</code> заполнено на <b>$used_percent%</b>
+      • Свободно: ${avail_gb} ГБ из ${total_gb} ГБ
+      • $warning_text"
+
+        log_message "Добавлено предупреждение о хранилище $storage_name в отчет: $used_percent%"
+        echo "$warning_section"
+    else
+        echo ""
+    fi
+}
+
+# ========================
+# TELEGRAM И API ФУНКЦИИ
+# ========================
+send_telegram_message() {
+    local message="$1"
+    local disable_notification="${2:-false}"
+    log_message "Отправка уведомления в Telegram"
+
+    message=$(echo "$message" | sed 's/&/\&amp;/g')
+
+    local json_data="{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${message}\", \"parse_mode\": \"HTML\", \"disable_notification\": ${disable_notification}"
+    if [ -n "$TELEGRAM_THREAD_ID" ] && [ "$TELEGRAM_THREAD_ID" != "" ]; then
+        json_data="${json_data}, \"message_thread_id\": ${TELEGRAM_THREAD_ID}"
+    fi
+    json_data="${json_data}}"
+
+    local response=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "$json_data" 2>/dev/null)
+    if echo "$response" | grep -q '"ok":true'; then
+        log_message "Уведомление отправлено"
+        return 0
+    else
+        log_message "ОШИБКА отправки: $response"
+
+        # Фаллбек без thread_id
+        if [ -n "$TELEGRAM_THREAD_ID" ]; then
+            local json_fallback="{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${message}\", \"parse_mode\": \"HTML\", \"disable_notification\": ${disable_notification}}"
+            local response_fallback=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$json_fallback" 2>/dev/null)
+            if echo "$response_fallback" | grep -q '"ok":true'; then
+                log_message "Уведомление отправлено в основной чат"
+                return 0
+            fi
+        fi
+        return 1
+    fi
+}
+
+get_cluster_info() {
+    local cluster_response=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/cluster/status" 2>/dev/null)
+    if [ -n "$cluster_response" ]; then
+        echo "$cluster_response" | jq -r '.data[] | select(.type=="cluster") | .name' 2>/dev/null || echo "Unknown"
+    else
+        echo "Unknown"
+    fi
+}
+
+get_node_info() {
+    local node_name="$1"
+    local node_response=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/status" 2>/dev/null)
+    if [ -n "$node_response" ]; then
+        local cpu_usage=$(echo "$node_response" | jq -r '.data.cpu // 0' 2>/dev/null)
+        local memory_usage=$(echo "$node_response" | jq -r '.data.memory.used // 0' 2>/dev/null)
+        local memory_total=$(echo "$node_response" | jq -r '.data.memory.total // 1' 2>/dev/null)
+
+        local cpu_percent=$((${cpu_usage%.*} * 100))
+        local mem_percent=$((memory_usage * 100 / memory_total))
+
+        echo "CPU: ${cpu_percent}%, RAM: ${mem_percent}%"
+    else
+        echo "Status: Unknown"
+    fi
+}
+
+get_simple_storage_info() {
+    local storage_name="$1"
+    local node_name="$2"
+
+    local storage_response=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/storage/${storage_name}/status" 2>/dev/null)
+
+    if [ -n "$storage_response" ] && echo "$storage_response" | jq -e '.data' >/dev/null 2>&1; then
+        local total=$(echo "$storage_response" | jq -r '.data.total // 0' 2>/dev/null)
+        local used=$(echo "$storage_response" | jq -r '.data.used // 0' 2>/dev/null)
+        local avail=$(echo "$storage_response" | jq -r '.data.avail // 0' 2>/dev/null)
+
+        if [ "$total" -gt 0 ]; then
+            local used_percent=$((used * 100 / total))
+            local avail_gb=$((avail / 1024 / 1024 / 1024))
+            echo "${avail_gb}|${used_percent}"
+        else
+            echo "0|0"
+        fi
+    else
+        echo "0|0"
+    fi
+}
+
+get_monitoring_mode() {
+    if [ -n "$PROXMOX_NODE" ] && [ "$PROXMOX_NODE" != "" ]; then
+        echo "node"
+    else
+        echo "cluster"
+    fi
+}
+
+get_tasks_url() {
+    local mode=$(get_monitoring_mode)
+    if [ "$mode" = "node" ]; then
+        echo "${PROXMOX_API_URL}/nodes/${PROXMOX_NODE}/tasks"
+    else
+        echo "${PROXMOX_API_URL}/cluster/tasks"
+    fi
+}
+
+check_api_connection() {
+    local response=$(curl -s -k \
+        -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/version" 2>/dev/null)
+    if echo "$response" | grep -q '"data"' && echo "$response" | grep -q '"version"'; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ========================
+# ФУНКЦИИ ОТСЛЕЖИВАНИЯ ЗАДАНИЙ
+# ========================
+task_already_sent() {
+    local task_id="$1"
+    touch "$SENT_TASKS_FILE"
+    grep -Fxq "$task_id" "$SENT_TASKS_FILE" 2>/dev/null
+}
+
+mark_task_as_sent() {
+    local task_id="$1"
+    touch "$SENT_TASKS_FILE"
+    if ! grep -Fxq "$task_id" "$SENT_TASKS_FILE" 2>/dev/null; then
+        echo "$task_id" >> "$SENT_TASKS_FILE"
+        sync
+    fi
+}
+
+error_already_sent() {
+    local error_id="$1"
+    touch "$SENT_ERRORS_FILE"
+    grep -Fxq "$error_id" "$SENT_ERRORS_FILE" 2>/dev/null
+}
+
+mark_error_as_sent() {
+    local error_id="$1"
+    touch "$SENT_ERRORS_FILE"
+    if ! grep -Fxq "$error_id" "$SENT_ERRORS_FILE" 2>/dev/null; then
+        echo "$error_id" >> "$SENT_ERRORS_FILE"
+        sync
+    fi
+}
+
+# Функция проверки недавности
+is_task_recent() {
+    local task_endtime="$1"
+    local task_status="$2"
+
+    # Если это NULL endtime, значит задача еще выполняется
+    if [ -z "$task_endtime" ] || [ "$task_endtime" = "null" ]; then
+        log_debug "ENDTIME пустой или null - задача все еще выполняется"
+        return 1
+    fi
+
+    local current_time=$(date +%s)
+    local task_age=$((current_time - task_endtime))
+
+    # Для заданий с ошибками используем более мягкий порог (увеличиваем в 3 раза)
+    local threshold="$RECENT_TASK_THRESHOLD"
+    if [ "$task_status" = "job errors" ] || [ "$task_status" = "ERROR" ] || echo "$task_status" | grep -qi "error\|fail\|interrupt"; then
+        threshold=$((RECENT_TASK_THRESHOLD * 3))
+        log_debug "Применяем увеличенный порог для задания с ошибкой: $threshold секунд ($(($threshold / 3600)) часов)"
+    fi
+
+    # Добавляем детальное логирование
+    local task_date=$(date -d "@$task_endtime" '+%d.%m.%Y %H:%M:%S' 2>/dev/null || echo "Unknown")
+    local current_date=$(date '+%d.%m.%Y %H:%M:%S')
+
+    log_debug "=== ПРОВЕРКА НЕДАВНОСТИ ЗАДАНИЯ ==="
+    log_debug "Задание завершилось: $task_date (timestamp: $task_endtime)"
+    log_debug "Текущее время: $current_date (timestamp: $current_time)"
+    log_debug "Возраст задания: $task_age секунд ($(($task_age / 3600)) часов $(($task_age % 3600 / 60)) минут)"
+    log_debug "Порог для статуса '$task_status': $threshold секунд ($(($threshold / 3600)) часов)"
+
+    if [ "$task_age" -le "$threshold" ]; then
+        log_debug "✅ ЗАДАНИЕ НЕДАВНЕЕ - будет обработано"
+        return 0
+    else
+        log_debug "❌ ЗАДАНИЕ СТАРОЕ - пропускаем (возраст больше порога на $(($task_age - $threshold)) секунд)"
+        return 1
+    fi
+}
+
+# ========================
+# ФУНКЦИИ ПАРСИНГА ЛОГОВ И VM DETECTION
+# ========================
+extract_vm_ids_from_log() {
+    local log_content="$1"
+    local vm_list=""
+
+    # Ищем все VM ID в логе
+    while IFS= read -r line; do
+        if echo "$line" | grep -q "Starting Backup of VM"; then
+            local vm_id=$(echo "$line" | grep -oP "Starting Backup of VM \K\d+" | head -1)
+            if [ -n "$vm_id" ]; then
+                if ! echo "$vm_list" | grep -q "\b$vm_id\b"; then
+                    vm_list="$vm_list $vm_id"
+                fi
+            fi
+        fi
+    done <<< "$log_content"
+
+    echo "$vm_list" | xargs
+}
+
+# Функция для получения VM из задания бэкапа
+get_vms_from_backup_job() {
+    local task_upid="$1"
+    local node_name="$2"
+
+    log_debug "=== ИЗВЛЕЧЕНИЕ VM ИЗ ЗАДАНИЯ ==="
+    log_debug "Получение списка VM из задания через API: $task_upid"
+
+    # Получаем лог задания
+    local log_response=$(get_task_log "$task_upid")
+    if [ -z "$log_response" ]; then
+        log_debug "ОШИБКА: Не удалось получить лог для задания $task_upid"
+        echo ""
+        return
+    fi
+
+    local log_content=$(echo "$log_response" | jq -r '.data[]?.t // empty' 2>/dev/null)
+    if [ -z "$log_content" ]; then
+        log_debug "ОШИБКА: Лог пустой для задания $task_upid"
+        echo ""
+        return
+    fi
+
+    # ПРИОРИТЕТ 1: Ищем строку запуска задания (первые 10 строк лога)
+    local job_line=$(echo "$log_content" | head -10 | grep "starting new backup job: vzdump" | head -1)
+
+    if [ -n "$job_line" ]; then
+        log_debug "Найдена строка запуска: $job_line"
+
+        # Извлечение VM ID из командной строки
+        local vm_ids=""
+
+        # Используем sed для извлечения части между vzdump и --
+        local vm_section=$(echo "$job_line" | sed -n 's/.*vzdump \([^-]*\)--.*/\1/p' | head -1)
+        if [ -n "$vm_section" ]; then
+            vm_ids=$(echo "$vm_section" | grep -oE '[0-9]+' | xargs)
+            log_debug "Метод 1 (sed): VM IDs = '$vm_ids'"
+        fi
+
+        # Если первый метод не сработал, используем альтернативный
+        if [ -z "$vm_ids" ]; then
+            vm_ids=$(echo "$job_line" | grep -oP 'vzdump\s+\K[^-]*' | head -1 | grep -oE '[0-9]+' | xargs)
+            log_debug "Метод 2 (grep): VM IDs = '$vm_ids'"
+        fi
+
+        # Если и это не сработало, используем awk
+        if [ -z "$vm_ids" ]; then
+            vm_ids=$(echo "$job_line" | awk '{
+                found_vzdump = 0
+                for(i=1; i<=NF; i++) {
+                    if($i == "vzdump") {
+                        found_vzdump = 1
+                        continue
+                    }
+                    if(found_vzdump && $i ~ /^--/) {
+                        break
+                    }
+                    if(found_vzdump && $i ~ /^[0-9]+$/) {
+                        printf "%s ", $i
+                    }
+                }
+            }' | xargs)
+            log_debug "Метод 3 (awk): VM IDs = '$vm_ids'"
+        fi
+
+        if [ -n "$vm_ids" ]; then
+            log_debug "УСПЕХ: Извлечены VM из команды запуска: '$vm_ids'"
+            echo "$vm_ids"
+            return
+        else
+            log_debug "ВНИМАНИЕ: Не удалось извлечь VM ID из командной строки: '$job_line'"
+        fi
+    fi
+
+    # ПРИОРИТЕТ 2: FALLBACK - ищем все VM которые упоминаются в логе
+    log_debug "Использую fallback метод - поиск 'Starting Backup' в логе"
+    local fallback_vms=""
+    while IFS= read -r line; do
+        if echo "$line" | grep -qE "(Starting Backup of VM|ERROR.*VM)" ; then
+            local vm_id=$(echo "$line" | grep -oP "VM \K\d+" | head -1)
+            if [ -n "$vm_id" ] && ! echo "$fallback_vms" | grep -qw "$vm_id"; then
+                fallback_vms="$fallback_vms $vm_id"
+            fi
+        fi
+    done <<< "$log_content"
+
+    fallback_vms=$(echo "$fallback_vms" | xargs)
+    log_debug "Fallback метод: VM IDs = '$fallback_vms'"
+
+    # ПРИОРИТЕТ 3: Если и fallback не дал результата, попробуем извлечь из самого UPID
+    if [ -z "$fallback_vms" ]; then
+        log_debug "Пробуем извлечь VM из содержимого лога по ключевым словам"
+        local any_vm_mentions=$(echo "$log_content" | grep -oE 'VM [0-9]+|vm [0-9]+' | grep -oE '[0-9]+' | sort -u | xargs)
+        if [ -n "$any_vm_mentions" ]; then
+            fallback_vms="$any_vm_mentions"
+            log_debug "Найдены упоминания VM: '$fallback_vms'"
+        fi
+    fi
+
+    log_debug "=== ИТОГ ИЗВЛЕЧЕНИЯ VM ==="
+    log_debug "Финальный результат: '$fallback_vms'"
+    echo "$fallback_vms"
+}
+
+# Функция валидации VM через API
+validate_vm_exists() {
+    local vm_id="$1"
+    local node_name="$2"
+
+    if ! [[ "$vm_id" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    # Проверяем QEMU
+    local qemu_response=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/qemu/${vm_id}/config" 2>/dev/null)
+    if echo "$qemu_response" | grep -q '"data"'; then
+        return 0
+    fi
+
+    # Проверяем LXC
+    local lxc_response=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/lxc/${vm_id}/config" 2>/dev/null)
+    if echo "$lxc_response" | grep -q '"data"'; then
+        return 0
+    fi
+
+    return 1
+}
+
+extract_node_from_upid() {
+    local task_upid="$1"
+    echo "$task_upid" | cut -d: -f2
+}
+
+get_task_log() {
+    local task_upid="$1"
+    local node_name
+    local mode=$(get_monitoring_mode)
+    if [ "$mode" = "node" ]; then
+        node_name="$PROXMOX_NODE"
+    else
+        node_name=$(extract_node_from_upid "$task_upid")
+    fi
+    curl -s -k \
+        -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/tasks/${task_upid}/log?limit=0" 2>/dev/null
+}
+
+extract_storage_from_log() {
+    local log_content="$1"
+    local storage=""
+    storage=$(echo "$log_content" | grep -oP -- "--storage \K[^\s]+" | head -1)
+    if [ -n "$storage" ]; then
+        echo "$storage"
+        return
+    fi
+    storage=$(echo "$log_content" | grep -oP "creating vzdump archive.*?/\K[^/]+" | head -1)
+    if [ -n "$storage" ]; then
+        echo "$storage"
+        return
+    fi
+    storage=$(echo "$log_content" | grep -oP "/mnt/pve/\K[^/]+" | head -1)
+    if [ -n "$storage" ]; then
+        echo "$storage"
+        return
+    fi
+    echo "Backups"
+}
+# Функция извлечения ошибок
+extract_error_from_log() {
+    local log_content="$1"
+    local vm_id="$2"
+
+    local error_msg=""
+
+    if [ -n "$vm_id" ]; then
+        log_debug "=== ПОИСК ОШИБКИ ДЛЯ VM $vm_id ==="
+
+        # Получаем весь блок лога для конкретной VM
+        local vm_log_block=""
+        local in_vm_block=false
+
+        while IFS= read -r line; do
+            # Начинаем блок для нашей VM
+            if echo "$line" | grep -q "Starting Backup of VM $vm_id"; then
+                in_vm_block=true
+                vm_log_block="$vm_log_block$line"$'\n'
+                continue
+            fi
+
+            # Если начался блок другой VM или задание завершилось, прекращаем
+            if echo "$line" | grep -q "Starting Backup of VM" && [ "$in_vm_block" = true ]; then
+                break
+            fi
+
+            if echo "$line" | grep -q "Backup job finished\|TASK ERROR\|aborting backup job" && [ "$in_vm_block" = true ]; then
+                vm_log_block="$vm_log_block$line"$'\n'
+                break
+            fi
+
+            # Добавляем строки в блок нашей VM
+            if [ "$in_vm_block" = true ]; then
+                vm_log_block="$vm_log_block$line"$'\n'
+
+                # Если дошли до "Finished Backup of VM" для нашей VM, прекращаем
+                if echo "$line" | grep -q "Finished Backup of VM $vm_id"; then
+                    break
+                fi
+            fi
+        done <<< "$log_content"
+
+        log_debug "Блок лога для VM $vm_id (${#vm_log_block} символов)"
+
+        # ПРИОРИТЕТ 1: Ищем прямую ошибку "ERROR: Backup of VM XXX failed"
+        error_msg=$(echo "$vm_log_block" | grep "ERROR: Backup of VM $vm_id failed" | head -1)
+        if [ -n "$error_msg" ]; then
+            log_debug "Найдена прямая ошибка бэкапа: '$error_msg'"
+            # Извлекаем причину из строки ошибки
+            local failure_reason=$(echo "$error_msg" | sed "s/ERROR: Backup of VM $vm_id failed - //" | sed 's/^INFO: //')
+            if [ -n "$failure_reason" ] && [ "$failure_reason" != "$error_msg" ]; then
+                error_msg="$failure_reason"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 2: QMP TIMEOUT ERRORS (Ошибки тайм-аута QMP команд)
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "VM $vm_id qmp command.*failed.*got timeout"; then
+                local qmp_line=$(echo "$vm_log_block" | grep -i "VM $vm_id qmp command.*failed.*got timeout" | head -1)
+                local qmp_command=$(echo "$qmp_line" | grep -oP "qmp command '\K[^']*" | head -1)
+                error_msg="qmp command '$qmp_command' failed - got timeout"
+                log_debug "Найдена QMP timeout ошибка: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 3: FLEECE IMAGE ERRORS (Ошибки флисинга)
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "disk image.*fleece.*already exists"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "disk image.*fleece.*already exists" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //')
+                log_debug "Найдена fleece image ошибка: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "zfs error.*cannot create.*fleece.*dataset already"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "zfs error.*cannot create.*fleece.*dataset already" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //')
+                log_debug "Найдена ZFS fleece ошибка: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 4: STORAGE ACCESS ERRORS (Ошибки доступа к хранилищу)
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "storage.*does not exist"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "storage.*does not exist" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //')
+                log_debug "Найдена ошибка отсутствия хранилища: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "unable to open.*Stale file handle"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "unable to open.*Stale file handle" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //')
+                log_debug "Найдена ошибка Stale file handle: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "can't activate storage.*directory.*does not exist"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "can't activate storage.*directory.*does not exist" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //')
+                log_debug "Найдена ошибка активации хранилища: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 5: DISK SPACE ISSUES (Проблемы с местом на диске)
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "backup write data failed.*No space left on device"; then
+                error_msg="backup write data failed: No space left on device"
+                log_debug "Найдена ошибка нехватки места: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "/tmp runs out of space"; then
+                error_msg="/tmp runs out of space"
+                log_debug "Найдена ошибка заполнения /tmp: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "No space left on device"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "No space left on device" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //' | sed 's/^[0-9:.-]*\s*//')
+                log_debug "Найдена общая ошибка нехватки места: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 6: NETWORK AND CONNECTIVITY ISSUES (Сетевые проблемы)
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "backup connect failed.*backup owner check failed"; then
+                error_msg="backup connect failed: command error: backup owner check failed"
+                log_debug "Найдена ошибка backup owner check: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "backup write data failed.*pipelined request failed"; then
+                error_msg="backup write data failed: pipelined request failed"
+                log_debug "Найдена ошибка pipelined request: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "backup.*failed.*connection"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "backup.*failed.*connection" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //')
+                log_debug "Найдена сетевая ошибка бэкапа: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 7: CONTAINER-SPECIFIC ERRORS (Ошибки контейнеров)
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "tar.*permission denied"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "tar.*permission denied" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //' | sed 's/^[0-9:.-]*\s*//')
+                log_debug "Найдена ошибка tar permission denied: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "lxc-usernsexec.*failed.*exit code"; then
+                error_msg=$(echo "$vm_log_block" | grep -i "lxc-usernsexec.*failed.*exit code" | head -1)
+                error_msg=$(echo "$error_msg" | sed 's/^ERROR: //' | sed 's/^INFO: //')
+                log_debug "Найдена ошибка lxc-usernsexec: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 8: СИСТЕМНЫЕ ОШИБКИ PROXMOX
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "pvestatd.service.*Main process exited.*SEGV"; then
+                error_msg="pvestatd.service: Main process exited, code=killed, status=11/SEGV"
+                log_debug "Найдена ошибка pvestatd SEGV: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "backup_complete_cb -5"; then
+                error_msg="backup_complete_cb -5"
+                log_debug "Найдена ошибка backup_complete_cb: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 9: Ищем контекстную ошибку перед "ERROR: Backup of VM"
+        if [ -z "$error_msg" ]; then
+            # Ищем последнюю INFO строку перед ошибкой, которая может содержать детали
+            local context_line=$(echo "$vm_log_block" | grep -B1 "ERROR: Backup of VM $vm_id" | head -1)
+            if [ -n "$context_line" ] && echo "$context_line" | grep -qi "INFO:.*\(paused\|locked\|cannot\|failed\|error\|interrupted\)"; then
+                error_msg=$(echo "$context_line" | sed 's/^INFO: //' | sed 's/^[0-9:.-]*\s*//')
+                log_debug "Найдена контекстная ошибка: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 10: Ищем "interrupted by signal" и "aborting backup job"
+        if [ -z "$error_msg" ]; then
+            if echo "$vm_log_block" | grep -qi "interrupted by signal"; then
+                local interrupt_line=$(echo "$vm_log_block" | grep "interrupted by signal" | head -1)
+                error_msg=$(echo "$interrupt_line" | sed 's/^ERROR: //' | sed 's/^INFO: //' | sed 's/^[0-9:.-]*\s*//')
+                log_debug "Найдено прерывание по сигналу: '$error_msg'"
+            elif echo "$vm_log_block" | grep -qi "aborting backup job"; then
+                error_msg="aborting backup job"
+                log_debug "Найдено прерывание задания бэкапа: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 11: Ищем другие ошибки в блоке VM
+        if [ -z "$error_msg" ]; then
+            error_msg=$(echo "$vm_log_block" | grep -i "ERROR\|failed" | grep -i "VM $vm_id\|$vm_id.*failed" | tail -1)
+            if [ -n "$error_msg" ]; then
+                log_debug "Найдена общая ошибка в блоке VM: '$error_msg'"
+            fi
+        fi
+
+        # ПРИОРИТЕТ 12: Ищем специфичные паттерны ошибок
+        if [ -z "$error_msg" ]; then
+            # Ищем "VM is paused", "VM is locked", "cannot shutdown" и другие
+            error_msg=$(echo "$vm_log_block" | grep -i "VM is paused\|VM is locked\|cannot shutdown\|permission denied\|timeout\|VM not running" | tail -1)
+            if [ -n "$error_msg" ]; then
+                log_debug "Найден специфичный паттерн ошибки: '$error_msg'"
+                # Очищаем от INFO: префикса
+                error_msg=$(echo "$error_msg" | sed 's/^INFO: //' | sed 's/^ERROR: //' | sed 's/^[0-9:.-]*\s*//')
+            fi
+        fi
+
+        log_debug "Итоговая найденная ошибка для VM $vm_id: '$error_msg'"
+    fi
+
+    # Дополнительные паттерны для общих ошибок если не найдено для конкретной VM
+    if [ -z "$error_msg" ]; then
+        error_msg=$(echo "$log_content" | grep -i "TASK ERROR" | tail -1)
+    fi
+    if [ -z "$error_msg" ]; then
+        error_msg=$(echo "$log_content" | grep -i "job errors" | tail -1)
+    fi
+    if [ -z "$error_msg" ]; then
+        error_msg=$(echo "$log_content" | grep -i "ERROR:" | tail -1)
+    fi
+
+    # Убираем timestamp и чистим
+    error_msg=$(echo "$error_msg" | sed 's/^[0-9:.-]*\s*//' | sed 's/^INFO: //' | sed 's/^ERROR: //')
+
+    if [ -n "$error_msg" ]; then
+        echo "$error_msg"
+    else
+        echo "Неизвестная ошибка бэкапа"
+    fi
+}
+
+# Функция для извлечения информации о бэкапе с переводом статусов
+extract_backup_info_from_log() {
+    local log_content="$1"
+    local vm_id="$2"
+
+    # Извлекаем размер архива для конкретной VM
+    local backup_size="Unknown"
+    local backup_type="Unknown"
+
+    log_debug "Извлечение информации о бэкапе для VM $vm_id"
+
+    # Ищем размер архива в блоке конкретной VM
+    # Получаем весь блок лога для конкретной VM
+    local vm_log_block=""
+    local in_vm_block=false
+
+    while IFS= read -r line; do
+        # Начинаем блок для нашей VM
+        if echo "$line" | grep -q "Starting Backup of VM $vm_id"; then
+            in_vm_block=true
+            vm_log_block="$vm_log_block$line"$'\n'
+            continue
+        fi
+
+        # Если начался блок другой VM, прекращаем
+        if echo "$line" | grep -q "Starting Backup of VM" && [ "$in_vm_block" = true ]; then
+            break
+        fi
+
+        # Добавляем строки в блок нашей VM
+        if [ "$in_vm_block" = true ]; then
+            vm_log_block="$vm_log_block$line"$'\n'
+
+            # Если дошли до "Finished Backup of VM" для нашей VM, прекращаем
+            if echo "$line" | grep -q "Finished Backup of VM $vm_id"; then
+                break
+            fi
+        fi
+    done <<< "$log_content"
+
+    log_debug "Блок лога для VM $vm_id (${#vm_log_block} символов)"
+
+    # Теперь ищем размер архива в блоке этой VM
+    # 1. ПРИОРИТЕТ: "archive file size: 14.99GB"
+    local size_line=$(echo "$vm_log_block" | grep "archive file size:" | head -1)
+    if [ -n "$size_line" ]; then
+        backup_size=$(echo "$size_line" | grep -oP "archive file size: \K[^\s]+" | head -1)
+        log_debug "Найден размер архива из 'archive file size': $backup_size"
+    else
+        # 2. FALLBACK: "transferred 50.00 GiB in"
+        size_line=$(echo "$vm_log_block" | grep "transferred.*in" | head -1)
+        if [ -n "$size_line" ]; then
+            backup_size=$(echo "$size_line" | grep -oP "transferred \K[^\s]+\s+[^\s]+" | head -1)
+            log_debug "Найден размер из 'transferred': $backup_size"
+        else
+            # 3. ПОСЛЕДНИЙ FALLBACK: ищем в блоке размер из процентов
+            size_line=$(echo "$vm_log_block" | grep "100%" | tail -1)
+            if [ -n "$size_line" ]; then
+                backup_size=$(echo "$size_line" | grep -oP "100% \(\K[^)]+" | head -1)
+                log_debug "Найден размер из процентов: $backup_size"
+            fi
+        fi
+    fi
+
+    # Извлекаем тип бэкапа из блока VM с переводом на русский
+    local backup_mode_line=$(echo "$vm_log_block" | grep "backup mode:" | head -1)
+    if [ -n "$backup_mode_line" ]; then
+        local mode=$(echo "$backup_mode_line" | grep -oP "backup mode: \K[^\s]+" | head -1)
+        case "$mode" in
+            "stop")
+                backup_type="Остановка"
+                ;;
+            "snapshot")
+                backup_type="Снапшот"
+                ;;
+            "suspend")
+                backup_type="Приостановка"
+                ;;
+            *)
+                backup_type="$mode"
+                ;;
+        esac
+    fi
+
+    log_debug "Итоговые данные для VM $vm_id: размер='$backup_size', тип='$backup_type'"
+
+    # Возвращаем в формате "размер|тип"
+    echo "${backup_size}|${backup_type}"
+}
+
+# ========================
+# ФУНКЦИИ АНАЛИЗА СТАТУСОВ
+# ========================
+is_user_interrupted() {
+    local task_status="$1"
+    local log_content="$2"
+
+    log_debug "Проверка прерывания - статус: '$task_status'"
+
+    # Проверяем различные варианты статуса прерывания
+    case "$task_status" in
+        "stopped")
+            log_debug "Задача имеет статус 'stopped'"
+            return 0
+            ;;
+        "interrupted by signal")
+            log_debug "Задача имеет статус 'interrupted by signal'"
+            return 0
+            ;;
+        "ERROR"|"job errors"|"unexpected status")
+            log_debug "Задача имеет статус '$task_status', проверяем содержимое лога"
+            # Сначала проверяем на прерывание
+            if echo "$log_content" | grep -qi "interrupted by signal\|TASK ERROR.*interrupted\|aborting backup job"; then
+                log_debug "Найден паттерн прерывания в логе"
+                return 0
+            fi
+            # Дополнительная проверка: если задача была остановлена во время выполнения
+            if echo "$log_content" | grep -q "status = running" && echo "$log_content" | grep -qE "(ERROR|Failed|TASK ERROR)" && ! echo "$log_content" | grep -q "Finished Backup"; then
+                # Проверяем, нет ли явных ошибок приложения
+                if ! echo "$log_content" | grep -qi "VM is locked\|permission denied\|disk.*error\|storage.*error\|network.*error\|VM is paused\|cannot shutdown\|qmp.*timeout\|No space left\|fleece.*already exists"; then
+                    log_debug "Задание было остановлено во время выполнения без явных ошибок приложения"
+                    return 0
+                fi
+            fi
+            log_debug "Паттерн прерывания НЕ найден в логе, это обычная ошибка"
+            ;;
+        *)
+            # Проверяем другие статусы, которые могут означать прерывание
+            if echo "$task_status" | grep -qi "interrupt\|abort\|cancel\|stop"; then
+                log_debug "Статус содержит ключевые слова прерывания: '$task_status'"
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+is_task_with_errors() {
+    local task_status="$1"
+    local log_content="$2"
+
+    log_debug "Проверка на ошибки - статус: '$task_status'"
+
+    # Если это явно ошибка
+    if [ "$task_status" = "ERROR" ] || [ "$task_status" = "job errors" ] || [ "$task_status" = "unexpected status" ]; then
+        # Но сначала убеждаемся, что это не прерывание
+        if ! is_user_interrupted "$task_status" "$log_content"; then
+            return 0
+        fi
+    fi
+
+    # Проверяем в логе наличие ошибок (исключая прерывания)
+    if echo "$log_content" | grep -qi "backup.*failed\|ERROR.*VM.*failed\|VM is locked\|permission denied\|VM is paused\|cannot shutdown\|VM not running\|qmp.*timeout\|No space left\|fleece.*already exists\|storage.*does not exist" && ! echo "$log_content" | grep -qi "interrupted"; then
+        log_debug "Найдены ошибки в логе задания (не прерывание)"
+        return 0
+    fi
+
+    return 1
+}
+# Функция определения статуса VM
+get_vm_backup_status() {
+    local log_content="$1"
+    local vm_id="$2"
+
+    log_debug "Анализ статуса для VM $vm_id"
+
+    # Проверяем, завершилась ли VM успешно
+    if echo "$log_content" | grep -q "Finished Backup of VM $vm_id"; then
+        log_debug "VM $vm_id: найден Finished Backup - SUCCESS"
+        echo "SUCCESS"
+        return
+    fi
+
+    # Проверяем, есть ли ошибки для этой VM
+    if echo "$log_content" | grep -qi "ERROR.*VM $vm_id\|Backup of VM $vm_id failed\|VM $vm_id.*failed\|VM $vm_id.*error"; then
+        log_debug "VM $vm_id: найдена ошибка - ERROR"
+        echo "ERROR"
+        return
+    fi
+
+    # Проверяем, началось ли вообще бэкапирование этой VM
+    if echo "$log_content" | grep -q "Starting Backup of VM $vm_id"; then
+        log_debug "VM $vm_id: началась, но не завершилась"
+        # VM началась, но не завершилась - была прервана или упала
+        if echo "$log_content" | grep -qi "interrupted by signal\|aborting backup job"; then
+            log_debug "VM $vm_id: INTERRUPTED"
+            echo "INTERRUPTED"
+            return
+        else
+            log_debug "VM $vm_id: STARTED_BUT_FAILED"
+            echo "STARTED_BUT_FAILED"
+            return
+        fi
+    fi
+
+    # VM вообще не начиналась - определяем причину
+    if echo "$log_content" | grep -qi "interrupted by signal\|aborting backup job"; then
+        log_debug "VM $vm_id: CANCELLED (задание отменено)"
+        echo "CANCELLED"
+        return
+    elif echo "$log_content" | grep -qi "TASK ERROR\|job errors\|backup.*failed"; then
+        log_debug "VM $vm_id: FAILED_TO_START (ошибка до начала)"
+        echo "FAILED_TO_START"
+        return
+    fi
+
+    log_debug "VM $vm_id: UNKNOWN статус"
+    echo "UNKNOWN"
+}
+
+# ========================
+# ФУНКЦИИ VM ИНФОРМАЦИИ
+# ========================
+get_vm_name() {
+    local vm_id="$1"
+    local node_name="$2"
+    if ! [[ "$vm_id" =~ ^[0-9]+$ ]]; then
+        echo "Unknown"
+        return
+    fi
+    # Пробуем QEMU
+    local vm_info=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/qemu/${vm_id}/config" 2>/dev/null)
+    if [ -n "$vm_info" ]; then
+        local vm_name=$(echo "$vm_info" | jq -r '.data.name // empty' 2>/dev/null)
+        if [ -n "$vm_name" ] && [ "$vm_name" != "empty" ] && [ "$vm_name" != "null" ]; then
+            echo "$vm_name"
+            return
+        fi
+    fi
+    # Пробуем LXC
+    vm_info=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/lxc/${vm_id}/config" 2>/dev/null)
+    if [ -n "$vm_info" ]; then
+        local vm_name=$(echo "$vm_info" | jq -r '.data.hostname // .data.name // empty' 2>/dev/null)
+        if [ -n "$vm_name" ] && [ "$vm_name" != "empty" ] && [ "$vm_name" != "null" ]; then
+            echo "$vm_name"
+            return
+        fi
+    fi
+    echo "Unknown"
+}
+
+get_vm_type() {
+    local vm_id="$1"
+    local node_name="$2"
+    # Проверяем QEMU
+    local qemu_info=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/qemu/${vm_id}/config" 2>/dev/null)
+    if echo "$qemu_info" | grep -q '"data"'; then
+        echo "VM"
+        return
+    fi
+    # Проверяем LXC
+    local lxc_info=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" \
+        "${PROXMOX_API_URL}/nodes/${node_name}/lxc/${vm_id}/config" 2>/dev/null)
+    if echo "$lxc_info" | grep -q '"data"'; then
+        echo "CT"
+        return
+    fi
+    echo "Unknown"
+}
+
+# ========================
+# ФУНКЦИИ СОЗДАНИЯ СООБЩЕНИЙ
+# ========================
+create_error_message() {
+    local task_upid="$1"
+    local vm_id="$2"
+    local node="$3"
+    local error_msg="$4"
+    local start_time="$5"
+
+    local cluster_name=$(get_cluster_info)
+    local vm_name=$(get_vm_name "$vm_id" "$node")
+    local vm_type=$(get_vm_type "$vm_id" "$node")
+
+    # Получаем хранилище
+    local log_response=$(get_task_log "$task_upid")
+    local storage="Backups"
+    if [ -n "$log_response" ]; then
+        local log_content=$(echo "$log_response" | jq -r '.data[]?.t // empty' 2>/dev/null)
+        if [ -n "$log_content" ]; then
+            storage=$(extract_storage_from_log "$log_content")
+        fi
+    fi
+
+    local current_time=$(date '+%d.%m.%Y %H:%M:%S')
+    local formatted_start_time=$(format_time "$start_time")
+
+    local message="🚨 <b>Ошибка бэкапа VM/LXC</b>
+
+📋 <b>Информация о задаче</b>
+      • <b>Тип:</b> vzdump backup
+      • <b>Кластер:</b> $cluster_name
+      • <b>Узел:</b> $node
+
+🖥️ <b>Виртуальная машина</b>
+      • <b>ID:</b> $vm_id
+      • <b>Имя:</b> $vm_name
+      • <b>Тип:</b> $vm_type
+      • <b>Хранилище:</b> $storage
+
+❌ <b>Детали ошибки</b>
+      • <b>Статус:</b> Неудачно
+      • <b>Причина:</b> $error_msg
+      • <b>Время начала:</b> $formatted_start_time
+      • <b>Время ошибки:</b> $current_time
+
+🏷 #backup_error #vm_${vm_id} #node_${node}"
+
+    echo "$message"
+}
+
+create_stopped_message() {
+    local task_upid="$1"
+    local node="$2"
+    local start_time="$3"
+    local log_content="$4"
+
+    local cluster_name=$(get_cluster_info)
+
+    # Получаем хранилище
+    local storage="Backups"
+    if [ -n "$log_content" ]; then
+        storage=$(extract_storage_from_log "$log_content")
+    fi
+
+    local current_time=$(date '+%d.%m.%Y %H:%M:%S')
+    local formatted_start_time=$(format_time "$start_time")
+
+    # Определение причины остановки
+    local stop_reason="Остановлено пользователем"
+    if echo "$log_content" | grep -qi "interrupted by signal"; then
+        stop_reason="Прервано пользователем (CTRL+C или Stop)"
+    elif echo "$log_content" | grep -qi "aborting backup job"; then
+        stop_reason="Задание прервано вручную"
+    elif echo "$log_content" | grep -qi "TASK ERROR.*interrupted"; then
+        stop_reason="Задание остановлено пользователем"
+    fi
+
+    local message="🛑 <b>Задание бэкапа остановлено</b>
+
+📋 <b>Информация о задаче</b>
+      • <b>Тип:</b> vzdump backup
+      • <b>Кластер:</b> $cluster_name
+      • <b>Узел:</b> $node
+      • <b>Хранилище:</b> $storage
+
+⚠️ <b>Детали остановки</b>
+      • <b>Статус:</b> $stop_reason
+      • <b>Время начала:</b> $formatted_start_time
+      • <b>Время остановки:</b> $current_time
+
+🏷 #backup_stopped #node_${node}"
+
+    echo "$message"
+}
+# Функция создания отчета
+create_backup_summary() {
+    local task_upid="$1"
+    local task_status="$2"
+    local start_time="$3"
+    local end_time="$4"
+    local node="$5"
+
+    local log_response=$(get_task_log "$task_upid")
+    local log_content=""
+    local storage="Backups"
+
+    if [ -n "$log_response" ]; then
+        log_content=$(echo "$log_response" | jq -r '.data[]?.t // empty' 2>/dev/null | tr '\n' '\n')
+        if [ -n "$log_content" ]; then
+            storage=$(extract_storage_from_log "$log_content")
+        fi
+    fi
+
+    log_message "Создание отчета для задания: $task_upid"
+
+    # Парсим VM в задании
+    local total_vms=0
+    local successful_vms=0
+    local failed_vms=0
+    local successful_list=""
+    local failed_list=""
+    local vm_list=""
+
+    if [ -n "$log_content" ]; then
+        # Получаем ВСЕ VM из задания через улучшенную функцию
+        local all_job_vms=$(get_vms_from_backup_job "$task_upid" "$node")
+        if [ -n "$all_job_vms" ]; then
+            # ВАЛИДАЦИЯ: Проверяем, что все VM реально существуют
+            local validated_vms=""
+            for vm_id in $all_job_vms; do
+                if validate_vm_exists "$vm_id" "$node"; then
+                    validated_vms="$validated_vms $vm_id"
+                    log_debug "VM $vm_id валидирована и существует"
+                else
+                    log_debug "ВНИМАНИЕ: VM $vm_id не найдена в системе, но была в задании"
+                    validated_vms="$validated_vms $vm_id"  # Все равно включаем для полноты отчета
+                fi
+            done
+            vm_list=$(echo "$validated_vms" | xargs)
+            total_vms=$(echo "$vm_list" | wc -w)
+            log_debug "Валидированный список VM из задания: $vm_list (всего: $total_vms)"
+        else
+            # Fallback к старой логике (только начатые VM)
+            while IFS= read -r line; do
+                if echo "$line" | grep -q "Starting Backup of VM"; then
+                    vm_id=$(echo "$line" | grep -oP "Starting Backup of VM \K\d+")
+                    if [ -n "$vm_id" ]; then
+                        if ! echo "$vm_list" | grep -q "\b$vm_id\b"; then
+                            vm_list="$vm_list $vm_id"
+                            total_vms=$((total_vms + 1))
+                        fi
+                    fi
+                fi
+            done <<< "$log_content"
+            log_debug "Fallback: найдены только начатые VM: $vm_list (всего: $total_vms)"
+        fi
+
+        # Анализируем результат каждой VM
+        for vm_id in $vm_list; do
+            local vm_name=$(get_vm_name "$vm_id" "$node")
+            local vm_type=$(get_vm_type "$vm_id" "$node")
+            local vm_status=$(get_vm_backup_status "$log_content" "$vm_id")
+
+            log_debug "VM $vm_id ($vm_name) статус: $vm_status"
+
+            if [ "$vm_status" = "SUCCESS" ]; then
+                local vm_duration=$(echo "$log_content" | grep "Finished Backup of VM $vm_id" | grep -oP "\(\K[^)]+" | head -1)
+
+                # Извлечение информации о размере и типе бэкапа
+                local backup_info=$(extract_backup_info_from_log "$log_content" "$vm_id")
+                local backup_size=$(echo "$backup_info" | cut -d'|' -f1)
+                local backup_type=$(echo "$backup_info" | cut -d'|' -f2)
+
+                successful_vms=$((successful_vms + 1))
+
+                # Все элементы списка с одинаковыми отступами
+                if [ -z "$successful_list" ]; then
+                    successful_list="      • $vm_type $vm_id ($vm_name) — ${vm_duration:-Unknown}, $backup_size, [$backup_type]"
+                else
+                    successful_list="${successful_list}
+      • $vm_type $vm_id ($vm_name) — ${vm_duration:-Unknown}, $backup_size, [$backup_type]"
+                fi
+            else
+                failed_vms=$((failed_vms + 1))
+
+                # Обработка причин неудачи
+                local failure_reason="backup failed"
+
+                # Получаем конкретную ошибку для этой VM
+                local specific_error=$(extract_error_from_log "$log_content" "$vm_id")
+                log_debug "Конкретная ошибка для VM $vm_id: '$specific_error'"
+
+                # Анализ типа ошибки и переводим на русский
+                case "$vm_status" in
+                    "ERROR")
+                        # === QMP TIMEOUT ERRORS ===
+                        if echo "$specific_error" | grep -qi "qmp command.*backup.*failed.*got timeout"; then
+                            failure_reason="тайм-аут QMP команды backup"
+                        elif echo "$specific_error" | grep -qi "qmp command.*query-proxmox-support.*failed.*got timeout"; then
+                            failure_reason="тайм-аут QMP команды query-proxmox-support"
+                        elif echo "$specific_error" | grep -qi "qmp command.*backup-cancel.*failed.*got timeout"; then
+                            failure_reason="тайм-аут QMP команды backup-cancel"
+                        elif echo "$specific_error" | grep -qi "qmp command.*failed.*got timeout"; then
+                            local qmp_cmd=$(echo "$specific_error" | grep -oP "qmp command '\K[^']*" | head -1)
+                            failure_reason="тайм-аут QMP команды ${qmp_cmd:-неизвестной}"
+
+                        # === FLEECE IMAGE ERRORS ===
+                        elif echo "$specific_error" | grep -qi "disk image.*fleece.*already exists"; then
+                            failure_reason="ошибка флисинг образа (уже существует)"
+                        elif echo "$specific_error" | grep -qi "zfs error.*cannot create.*fleece.*dataset already"; then
+                            failure_reason="ошибка ZFS флисинг датасета (уже существует)"
+                        elif echo "$specific_error" | grep -qi "fleece"; then
+                            failure_reason="ошибка флисинг образа"
+
+                        # === STORAGE ACCESS ERRORS ===
+                        elif echo "$specific_error" | grep -qi "storage.*does not exist"; then
+                            local storage_name=$(echo "$specific_error" | grep -oP "storage '\K[^']*" | head -1)
+                            failure_reason="хранилище ${storage_name:-неизвестное} не существует"
+                        elif echo "$specific_error" | grep -qi "unable to open.*Stale file handle"; then
+                            failure_reason="ошибка доступа к файлу (Stale file handle)"
+                        elif echo "$specific_error" | grep -qi "can't activate storage.*directory.*does not exist"; then
+                            failure_reason="невозможно активировать хранилище (директория не существует)"
+
+                        # === DISK SPACE ISSUES ===
+                        elif echo "$specific_error" | grep -qi "backup write data failed.*No space left on device"; then
+                            failure_reason="нехватка места на диске при записи"
+                        elif echo "$specific_error" | grep -qi "/tmp runs out of space"; then
+                            failure_reason="переполнение /tmp директории"
+                        elif echo "$specific_error" | grep -qi "No space left on device"; then
+                            failure_reason="нехватка места на диске"
+
+                        # === NETWORK AND CONNECTIVITY ISSUES ===
+                        elif echo "$specific_error" | grep -qi "backup connect failed.*backup owner check failed"; then
+                            failure_reason="сетевая ошибка (backup owner check failed)"
+                        elif echo "$specific_error" | grep -qi "backup write data failed.*pipelined request failed"; then
+                            failure_reason="сетевая ошибка (pipelined request failed)"
+                        elif echo "$specific_error" | grep -qi "backup.*failed.*connection"; then
+                            failure_reason="сетевая ошибка подключения"
+
+                        # === CONTAINER-SPECIFIC ERRORS ===
+                        elif echo "$specific_error" | grep -qi "tar.*permission denied"; then
+                            failure_reason="ошибка контейнера (tar permission denied)"
+                        elif echo "$specific_error" | grep -qi "lxc-usernsexec.*failed.*exit code"; then
+                            local exit_code=$(echo "$specific_error" | grep -oP "exit code \K\d+" | head -1)
+                            failure_reason="ошибка контейнера (lxc-usernsexec код ${exit_code:-неизвестный})"
+
+                        # === СИСТЕМНЫЕ ОШИБКИ PROXMOX ===
+                        elif echo "$specific_error" | grep -qi "pvestatd.service.*Main process exited.*SEGV"; then
+                            failure_reason="системная ошибка (pvestatd segfault)"
+                        elif echo "$specific_error" | grep -qi "backup_complete_cb -5"; then
+                            failure_reason="системная ошибка (backup_complete_cb -5)"
+
+                        # === КЛАССИЧЕСКИЕ ОШИБКИ (из предыдущей версии) ===
+                        elif echo "$specific_error" | grep -qi "VM is locked"; then
+                            failure_reason="VM заблокирована"
+                        elif echo "$specific_error" | grep -qi "VM is paused.*cannot shutdown"; then
+                            failure_reason="VM приостановлена — не удалось остановить"
+                        elif echo "$specific_error" | grep -qi "VM is paused"; then
+                            failure_reason="VM была приостановлена"
+                        elif echo "$specific_error" | grep -qi "cannot shutdown"; then
+                            failure_reason="не удалось остановить VM"
+                        elif echo "$specific_error" | grep -qi "permission denied"; then
+                            failure_reason="нет доступа"
+                        elif echo "$specific_error" | grep -qi "storage.*error\|disk.*error"; then
+                            failure_reason="ошибка хранилища"
+                        elif echo "$specific_error" | grep -qi "network.*error"; then
+                            failure_reason="ошибка сети"
+                        elif echo "$specific_error" | grep -qi "timeout"; then
+                            failure_reason="превышен тайм-аут"
+                        elif echo "$specific_error" | grep -qi "interrupted by signal"; then
+                            failure_reason="прервано по сигналу"
+                        elif echo "$specific_error" | grep -qi "VM not running"; then
+                            failure_reason="VM не запущена"
+                        elif echo "$specific_error" | grep -qi "genisoimage.*failed.*interrupted by signal"; then
+                            failure_reason="прервано при создании cloud-init образа"
+                        elif echo "$specific_error" | grep -qi "command.*failed.*exit code"; then
+                            # Извлекаем код выхода
+                            local exit_code=$(echo "$specific_error" | grep -oP "exit code \K\d+" | head -1)
+                            if [ -n "$exit_code" ]; then
+                                failure_reason="команда завершилась с ошибкой $exit_code"
+                            else
+                                failure_reason="команда завершилась с ошибкой"
+                            fi
+                        elif [ -n "$specific_error" ] && [ "$specific_error" != "Неизвестная ошибка бэкапа" ]; then
+                            # Используем конкретное описание ошибки, если оно информативно
+                            if [ ${#specific_error} -lt 150 ]; then  # Если описание не слишком длинное
+                                failure_reason="$specific_error"
+                            else
+                                failure_reason="ошибка бэкапа (см. логи)"
+                            fi
+                        else
+                            failure_reason="ошибка бэкапа (см. логи)"
+                        fi
+                        ;;
+                    "STARTED_BUT_FAILED")
+                        failure_reason="прервано при выполнении"
+                        ;;
+                    "INTERRUPTED")
+                        failure_reason="прервано пользователем"
+                        ;;
+                    "CANCELLED")
+                        failure_reason="задание отменено"
+                        ;;
+                    "FAILED_TO_START")
+                        failure_reason="не запущено (ошибка задания)"
+                        ;;
+                    *)
+                        failure_reason="неизвестная ошибка"
+                        ;;
+                esac
+
+                log_debug "Итоговая причина неудачи для VM $vm_id: '$failure_reason'"
+
+                # Все элементы списка с одинаковыми отступами
+                if [ -z "$failed_list" ]; then
+                    failed_list="      • $vm_type $vm_id ($vm_name) — $failure_reason"
+                else
+                    failed_list="${failed_list}
+      • $vm_type $vm_id ($vm_name) — $failure_reason"
+                fi
+            fi
+        done
+    fi
+
+    # Fallback - извлекаем VM ID из строки задания (если основная логика не сработала)
+    if [ "$total_vms" -eq 0 ]; then
+        local vm_id=$(echo "$log_content" | grep "starting new backup job: vzdump" | head -1 | grep -oP "vzdump \K\d+" | head -1)
+        if [ -n "$vm_id" ] && [ "$vm_id" != "" ]; then
+            total_vms=1
+            local vm_name=$(get_vm_name "$vm_id" "$node")
+            local vm_type=$(get_vm_type "$vm_id" "$node")
+
+            if [ "$task_status" = "OK" ]; then
+                # Добавляем информацию о размере и типе для fallback
+                local backup_info=$(extract_backup_info_from_log "$log_content" "$vm_id")
+                local backup_size=$(echo "$backup_info" | cut -d'|' -f1)
+                local backup_type=$(echo "$backup_info" | cut -d'|' -f2)
+
+                successful_vms=1
+                successful_list="      • $vm_type $vm_id ($vm_name) — Unknown, $backup_size, [$backup_type]"
+            else
+                failed_vms=1
+                failed_list="      • $vm_type $vm_id ($vm_name) — Status: $task_status"
+            fi
+        else
+            total_vms=1
+            successful_vms=0
+            failed_vms=1
+            failed_list="      • Неизвестная VM — не удалось определить ID"
+        fi
+    fi
+
+    # Вычисляем длительность
+    local duration=""
+    if [ -n "$start_time" ] && [ -n "$end_time" ] && [ "$start_time" != "Unknown" ] && [ "$end_time" != "Running" ]; then
+        local start_epoch=$(date -d "$start_time" +%s 2>/dev/null)
+        local end_epoch=$(date -d "$end_time" +%s 2>/dev/null)
+        if [ -n "$start_epoch" ] && [ -n "$end_epoch" ]; then
+            local duration_seconds=$((end_epoch - start_epoch))
+            local hours=$((duration_seconds / 3600))
+            local minutes=$(((duration_seconds % 3600) / 60))
+            local seconds=$((duration_seconds % 60))
+            if [ "$hours" -gt 0 ]; then
+                duration="${hours}ч ${minutes}м ${seconds}с"
+            elif [ "$minutes" -gt 0 ]; then
+                duration="${minutes}м ${seconds}с"
+            else
+                duration="${seconds}с"
+            fi
+        fi
+    fi
+
+    local cluster_name=$(get_cluster_info)
+    local node_status=$(get_node_info "$node")
+    local storage_info=$(get_simple_storage_info "$storage" "$node")
+    IFS='|' read -r avail_gb used_percent <<< "$storage_info"
+
+    # Проверяем хранилище на предупреждения
+    local storage_warning=$(check_storage_for_report "$storage" "$node")
+
+    # Определяем иконку статуса
+    local status_icon="🏁"
+    if [ "$successful_vms" -eq "$total_vms" ] && [ "$failed_vms" -eq 0 ]; then
+        status_icon="✅"
+    elif [ "$failed_vms" -gt 0 ]; then
+        status_icon="⚠️"
+    fi
+    local formatted_end_time=$(format_time "$end_time")
+
+    # Форматирование сообщения
+    local message="$status_icon <b>Завершение задания бэкапа</b>
+
+🔧 <b>ПАРАМЕТРЫ ЗАПУСКА</b>
+      • <b>Кластер:</b> <code>$cluster_name</code>
+      • <b>Узел:</b> <code>$node</code>
+      • <b>Хранилище бекапа:</b> <code>$storage</code>
+      • <b>Завершен:</b> $formatted_end_time"
+
+    if [ -n "$duration" ]; then
+        message="$message
+
+⚡ <b>ПРОИЗВОДИТЕЛЬНОСТЬ</b>
+      • <b>Время выполнения:</b> $duration
+      • <b>Хранилище:</b>
+        - Свободно: ${avail_gb} ГБ
+        - Использовано: ${used_percent}%"
+    fi
+
+    message="$message
+
+📊 <b>РЕЗУЛЬТАТЫ</b>
+      • <b>Всего объектов:</b> <b>$total_vms</b>
+      • <b>Успешно:</b> <b>$successful_vms</b>
+      • <b>С ошибками:</b> <b>$failed_vms</b>"
+
+    if [ -n "$successful_list" ] && [ "$successful_vms" -gt 0 ]; then
+        message="$message
+
+🎯 <b>Успешные ВМ/CT</b>
+$successful_list"
+    fi
+
+    if [ -n "$failed_list" ] && [ "$failed_vms" -gt 0 ]; then
+        message="$message
+
+⚠️ <b>Неуспешные ВМ/CT</b>
+$failed_list"
+    fi
+
+    # Добавляем предупреждения о хранилище в конец отчета (если есть)
+    if [ -n "$storage_warning" ]; then
+        message="$message$storage_warning"
+    fi
+
+    message="$message
+
+🏷 #backup_summary #node_${node}"
+
+    log_message "Отчет сформирован: $successful_vms/$total_vms успешно"
+    echo "$message"
+}
+# ========================
+# ОСНОВНОЙ ЦИКЛ
+# ========================
+touch "$SENT_TASKS_FILE"
+touch "$SENT_ERRORS_FILE"
+touch "$TRACKING_TASKS_FILE"
+touch "$LOG_FILE"
+
+log_message "=== Proxmox Backup Monitor Started v3.9 ==="
+
+# Получаем информацию о кластере
+cluster_name=$(get_cluster_info)
+current_node=$(hostname)
+node_status=$(get_node_info "$current_node" 2>/dev/null || echo "Status: Online")
+
+log_debug "Подготовка стартового уведомления"
+log_debug "cluster_name='$cluster_name', current_node='$current_node', node_status='$node_status'"
+
+# Стартовое уведомление Proxmox Backup Monitor
+startup_message="<b>Proxmox Backup Monitor</b>
+━━━━━━━━━
+🛠️ <b>ИНИЦИАЛИЗАЦИЯ</b>
+┏━━━━━━━━
+┃ <b>Статус:</b> ✅Запущен
+┃ <b>Версия:</b> v1.0
+┃ <b>Кластер:</b> $cluster_name
+┃ <b>Режим мониторинга:</b> $(get_monitoring_mode)
+┃ <b>Узел выполнения:</b> $current_node
+┗━━━━━━━━
+┏━━━━━━━━
+┃ <b>DEBUG режим:</b> $([ "$DEBUG_ENABLED" = "true" ] && echo "🔍Включен" || echo "🔒Отключен")
+┃ <b>Автоочистка:</b> $([ "$CLEANUP_ENABLED" = "true" ] && echo "🧹Включена" || echo "🔒Отключена")
+┃ <b>Предупреждения хранилища:</b> $([ "$STORAGE_WARNING_ENABLED" = "true" ] && echo "📊В отчетах ($STORAGE_WARNING_THRESHOLD%)" || echo "🔒Отключены")
+┗━━━━━━━━
+
+<b>Время запуска:</b> $(date '+%d.%m.%Y %H:%M:%S')
+
+🏷 #monitoring_started"
+
+log_debug "Отправка стартового уведомления"
+if send_telegram_message "$startup_message" "true"; then
+    log_message "Стартовое уведомление успешно отправлено"
+else
+    log_message "ОШИБКА: Не удалось отправить стартовое уведомление"
+fi
+
+# Основной цикл
+while true; do
+    # Проверяем необходимость очистки
+    check_cleanup_needed
+
+    log_message "Проверка задач бекапа..."
+
+    if ! check_api_connection; then
+        log_message "ОШИБКА: Нет соединения с API"
+        sleep $CHECK_INTERVAL
+        continue
+    fi
+
+    tasks_url=$(get_tasks_url)
+    response=$(curl -s -k -H "Authorization: $PROXMOX_API_TOKEN" "$tasks_url" 2>/dev/null)
+
+    if [ -z "$response" ] || ! echo "$response" | jq . >/dev/null 2>&1; then
+        log_message "ОШИБКА: Некорректный ответ API"
+        sleep $CHECK_INTERVAL
+        continue
+    fi
+
+    temp_tasks_file=$(mktemp)
+    echo "$response" | jq -c '.data[]?' 2>/dev/null > "$temp_tasks_file"
+
+    while IFS= read -r task; do
+        if [ -z "$task" ]; then
+            continue
+        fi
+
+        task_id=$(echo "$task" | jq -r '.upid // empty')
+        task_type=$(echo "$task" | jq -r '.type // empty')
+        task_status=$(echo "$task" | jq -r '.status // empty')
+        task_starttime=$(echo "$task" | jq -r '.starttime // empty')
+        task_endtime=$(echo "$task" | jq -r '.endtime // empty')
+        task_node=$(echo "$task" | jq -r '.node // empty')
+
+        # Фильтры
+        if [ "$task_type" != "vzdump" ]; then
+            continue
+        fi
+
+        # DEBUG: логируем все vzdump задания с ПОЛНОЙ информацией
+        log_debug "=== НАЙДЕНО VZDUMP ЗАДАНИЕ ==="
+        log_debug "ID: $task_id"
+        log_debug "Статус: '$task_status'"
+        log_debug "StartTime: $task_starttime"
+        log_debug "EndTime: $task_endtime"
+        log_debug "Node: $task_node"
+
+        # Проверка возраста только для running задач
+        if [ "$task_status" = "running" ] || [ -z "$task_status" ]; then
+            if [ -n "$task_starttime" ] && [ "$task_starttime" != "null" ]; then
+                current_time=$(date +%s)
+                task_age=$((current_time - task_starttime))
+                if [ "$task_age" -gt "$MAX_TASK_AGE" ]; then
+                    log_debug "ПРОПУСК: running задание слишком старое"
+                    continue
+                fi
+            fi
+        fi
+
+        # Преобразуем время
+        if [ -n "$task_starttime" ] && [ "$task_starttime" != "null" ]; then
+            start_time=$(date -d "@$task_starttime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Unknown")
+        else
+            start_time="Unknown"
+        fi
+
+        if [ -n "$task_endtime" ] && [ "$task_endtime" != "null" ]; then
+            end_time=$(date -d "@$task_endtime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "Running")
+        else
+            end_time="Running"
+        fi
+
+        # Проверка ошибок в running заданиях
+        if [ "$task_status" = "running" ] || [ -z "$task_status" ]; then
+            log_response=$(get_task_log "$task_id")
+            if [ -n "$log_response" ]; then
+                log_content=$(echo "$log_response" | jq -r '.data[]?.t // empty' 2>/dev/null)
+                if [ -n "$log_content" ]; then
+                    # Ищем VM с ошибками в логе
+                    while IFS= read -r line; do
+                        if echo "$line" | grep -q "Starting Backup of VM"; then
+                            vm_id=$(echo "$line" | grep -oP "Starting Backup of VM \K\d+")
+                            if [ -n "$vm_id" ]; then
+                                # Проверяем, есть ли ошибка для этой VM
+                                if echo "$log_content" | grep -qi "error.*VM $vm_id\|VM $vm_id.*error\|VM $vm_id.*failed\|qmp.*timeout.*VM $vm_id\|fleece.*VM $vm_id\|No space left.*VM $vm_id"; then
+                                    error_id="${task_id}_${vm_id}"
+                                    if ! error_already_sent "$error_id"; then
+                                        error_msg=$(extract_error_from_log "$log_content" "$vm_id")
+                                        error_message=$(create_error_message "$task_id" "$vm_id" "$task_node" "$error_msg" "$start_time")
+                                        if send_telegram_message "$error_message"; then
+                                            mark_error_as_sent "$error_id"
+                                            log_message "Отправлено уведомление об ошибке VM $vm_id: $task_id"
+                                        fi
+                                    fi
+                                fi
+                            fi
+                        fi
+                    done <<< "$log_content"
+                fi
+            fi
+        fi
+
+        # Логика для завершенных заданий
+        if [ "$task_status" = "stopped" ] || [ "$task_status" = "ERROR" ] || [ "$task_status" = "interrupted by signal" ] || [ "$task_status" = "job errors" ] || [ "$task_status" = "unexpected status" ] || echo "$task_status" | grep -qi "interrupt\|abort\|cancel\|error\|stop\|fail"; then
+            log_debug "=== ОБРАБОТКА ЗАВЕРШЕННОГО ЗАДАНИЯ ==="
+            log_debug "Обрабатываем завершенное задание $task_id со статусом '$task_status'"
+
+            # Проверяем, было ли уже отправлено
+            if task_already_sent "$task_id"; then
+                log_debug "ПРОПУСК: Задание $task_id уже обработано ранее"
+                continue
+            fi
+
+            # Проверяем недавность задания с учетом статуса
+            if ! is_task_recent "$task_endtime" "$task_status"; then
+                log_debug "ПРОПУСК: Задание $task_id не прошло проверку недавности"
+                continue
+            fi
+
+            log_debug "ПРИНЯТО К ОБРАБОТКЕ: Задание $task_id подходит для обработки"
+
+            # Получаем лог для проверки причины
+            log_response=$(get_task_log "$task_id")
+            log_content=""
+            if [ -n "$log_response" ]; then
+                log_content=$(echo "$log_response" | jq -r '.data[]?.t // empty' 2>/dev/null)
+                log_debug "Получен лог для задания $task_id (${#log_content} символов)"
+            else
+                log_debug "НЕ УДАЛОСЬ получить лог для задания $task_id"
+            fi
+
+            # Обработка для "job errors"
+            if [ "$task_status" = "job errors" ]; then
+                log_debug "=== ОБРАБОТКА ЗАДАНИЯ С 'job errors' ==="
+                log_message "⚡ НАЧАЛО обработки задания $task_id с 'job errors'"
+
+                # Получаем список VM из задания
+                local vm_list=$(get_vms_from_backup_job "$task_id" "$task_node")
+                if [ -z "$vm_list" ]; then
+                    log_debug "Первичная функция не дала результата, используем fallback"
+                    vm_list=$(extract_vm_ids_from_log "$log_content")
+                fi
+
+                log_debug "=== РЕЗУЛЬТАТ ИЗВЛЕЧЕНИЯ VM ==="
+                log_debug "VM в задании с ошибками: '$vm_list'"
+                log_message "📋 VM в задании: '$vm_list'"
+
+                if [ -n "$vm_list" ]; then
+                    log_message "🔍 Анализирую статус каждой VM..."
+                    # Отправляем ошибки для каждой VM с проблемами
+                    local errors_sent=0
+                    for vm_id in $vm_list; do
+                        local vm_status=$(get_vm_backup_status "$log_content" "$vm_id")
+                        log_debug "=== АНАЛИЗ VM $vm_id ==="
+                        log_debug "VM $vm_id определен статус: '$vm_status'"
+                        log_message "🖥️ VM $vm_id: статус = $vm_status"
+
+                        # Отправляем уведомления об ошибке для всех не успешных VM
+                        if [ "$vm_status" = "ERROR" ] || [ "$vm_status" = "STARTED_BUT_FAILED" ] || [ "$vm_status" = "FAILED_TO_START" ] || [ "$vm_status" = "INTERRUPTED" ]; then
+                            error_id="${task_id}_${vm_id}"
+                            log_debug "Проверяем отправку ошибки для $error_id"
+                            if ! error_already_sent "$error_id"; then
+                                error_msg=$(extract_error_from_log "$log_content" "$vm_id")
+                                log_debug "Отправляем ошибку для VM $vm_id: '$error_msg'"
+                                log_message "🚨 Отправляю ошибку для VM $vm_id: $error_msg"
+                                error_message=$(create_error_message "$task_id" "$vm_id" "$task_node" "$error_msg" "$start_time")
+
+                                # Подтверждение отправки
+                                if send_telegram_message "$error_message"; then
+                                    mark_error_as_sent "$error_id"
+                                    errors_sent=$((errors_sent + 1))
+                                    log_message "✅ УСПЕШНО отправлено уведомление об ошибке для VM $vm_id"
+                                else
+                                    log_message "❌ ОШИБКА отправки уведомления об ошибке для VM $vm_id"
+                                fi
+                            else
+                                log_debug "Ошибка для VM $vm_id уже была отправлена ранее"
+                                log_message "ℹ️ Ошибка для VM $vm_id уже была отправлена"
+                            fi
+                        else
+                            log_debug "VM $vm_id имеет статус $vm_status - пропускаем отправку ошибки"
+                            log_message "ℹ️ VM $vm_id не требует отправки ошибки (статус: $vm_status)"
+                        fi
+                    done
+
+                    log_message "📊 Отправлено ошибок: $errors_sent"
+
+                    # Ждем перед отправкой итогового отчета
+                    if [ "$errors_sent" -gt 0 ]; then
+                        log_debug "Ждем 3 секунды перед отправкой итогового отчета"
+                        sleep 3
+                    fi
+
+                    # Всегда отправляем итоговый отчет для заданий с ошибками
+                    log_message "📄 Отправляю итоговый отчет для задания с ошибками"
+                    summary_message=$(create_backup_summary "$task_id" "$task_status" "$start_time" "$end_time" "$task_node")
+                    if send_telegram_message "$summary_message"; then
+                        log_message "✅ УСПЕШНО отправлен итоговый отчет для задания с ошибками: $task_id"
+                    else
+                        log_message "❌ ОШИБКА отправки итогового отчета"
+                    fi
+
+                    mark_task_as_sent "$task_id"
+                    log_message "✅ ЗАВЕРШЕНА обработка задания $task_id с 'job errors'"
+                    log_debug "=== ЗАВЕРШЕНИЕ ОБРАБОТКИ 'job errors' ==="
+                else
+                    log_debug "ОШИБКА: Не удалось извлечь VM ID для задания с ошибками: $task_id"
+                    log_message "❌ ОШИБКА: Не удалось извлечь VM ID из задания $task_id"
+                    # Все равно помечаем как обработанное и отправляем базовый отчет
+                    summary_message=$(create_backup_summary "$task_id" "$task_status" "$start_time" "$end_time" "$task_node")
+                    send_telegram_message "$summary_message"
+                    mark_task_as_sent "$task_id"
+                fi
+                continue  # ВАЖНО: переходим к следующему заданию
+            fi
+
+            # Определяем тип завершения задания для других статусов
+            if is_user_interrupted "$task_status" "$log_content"; then
+                log_debug "Задание $task_id было прервано пользователем"
+                log_message "🛑 Задание $task_id было прервано пользователем"
+                stopped_message=$(create_stopped_message "$task_id" "$task_node" "$start_time" "$log_content")
+                if send_telegram_message "$stopped_message"; then
+                    log_message "✅ Отправлено уведомление об остановке: $task_id"
+                else
+                    log_message "❌ ОШИБКА отправки уведомления об остановке: $task_id"
+                fi
+
+                # Отправляем общий отчет ПОСЛЕ уведомления об остановке
+                sleep 2
+                summary_message=$(create_backup_summary "$task_id" "$task_status" "$start_time" "$end_time" "$task_node")
+                if send_telegram_message "$summary_message"; then
+                    log_message "✅ Отправлен итоговый отчет для прерванного задания: $task_id"
+                fi
+
+                mark_task_as_sent "$task_id"
+            elif is_task_with_errors "$task_status" "$log_content"; then
+                log_debug "Задание $task_id завершилось с другими ошибками"
+                log_message "⚠️ Задание $task_id завершилось с ошибками"
+
+                # Отправляем ошибки только для VM с реальными ошибками
+                vm_list=$(extract_vm_ids_from_log "$log_content")
+                if [ -z "$vm_list" ]; then
+                    vm_list=$(get_vms_from_backup_job "$task_id" "$task_node")
+                fi
+
+                if [ -n "$vm_list" ]; then
+                    for vm_id in $vm_list; do
+                        local vm_status=$(get_vm_backup_status "$log_content" "$vm_id")
+                        log_debug "VM $vm_id статус в ошибочном задании: $vm_status"
+
+                        if [ "$vm_status" = "ERROR" ] || [ "$vm_status" = "STARTED_BUT_FAILED" ]; then
+                            error_id="${task_id}_${vm_id}"
+                            if ! error_already_sent "$error_id"; then
+                                error_msg=$(extract_error_from_log "$log_content" "$vm_id")
+                                error_message=$(create_error_message "$task_id" "$vm_id" "$task_node" "$error_msg" "$start_time")
+                                if send_telegram_message "$error_message"; then
+                                    mark_error_as_sent "$error_id"
+                                    log_message "✅ Отправлено уведомление об ошибке для VM $vm_id: $task_id"
+                                fi
+                            fi
+                        fi
+                    done
+
+                    # Всегда отправляем итоговый отчет для смешанных заданий
+                    sleep 2
+                    summary_message=$(create_backup_summary "$task_id" "$task_status" "$start_time" "$end_time" "$task_node")
+                    if send_telegram_message "$summary_message"; then
+                        log_message "✅ Отправлен итоговый отчет для смешанного задания: $task_id"
+                    fi
+
+                    mark_task_as_sent "$task_id"
+                else
+                    log_debug "Не удалось извлечь VM ID для задания с ошибкой: $task_id"
+                    mark_task_as_sent "$task_id"
+                fi
+            else
+                log_debug "Неизвестный тип завершения задания $task_id со статусом '$task_status'"
+                log_message "❓ Неизвестный тип завершения для задания $task_id со статусом '$task_status'"
+                # Отправляем базовый отчет и помечаем как обработанное
+                summary_message=$(create_backup_summary "$task_id" "$task_status" "$start_time" "$end_time" "$task_node")
+                send_telegram_message "$summary_message"
+                mark_task_as_sent "$task_id"
+            fi
+        fi
+
+        # Отправляем итоговые отчеты только для полностью успешных заданий
+        if [ "$task_status" = "OK" ]; then
+
+            # Только недавние задачи
+            if ! is_task_recent "$task_endtime" "$task_status"; then
+                log_debug "ПРОПУСК: Успешное задание $task_id не прошло проверку недавности"
+                continue
+            fi
+
+            if ! task_already_sent "$task_id"; then
+                log_message "✅ Отправляю отчет для успешного задания $task_id"
+                summary_message=$(create_backup_summary "$task_id" "$task_status" "$start_time" "$end_time" "$task_node")
+                if send_telegram_message "$summary_message"; then
+                    mark_task_as_sent "$task_id"
+                    log_message "✅ Отчет отправлен для успешного задания: $task_id"
+                fi
+            fi
+        fi
+    done < "$temp_tasks_file"
+
+    rm -f "$temp_tasks_file"
+    sleep $CHECK_INTERVAL
+done
